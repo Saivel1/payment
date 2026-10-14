@@ -1,0 +1,121 @@
+name: payments
+
+# Networks:
+#   backend — internal only (no internet, nothing published): postgres, rabbitmq and the app services.
+#   edge    — only for the API, to publish its port (bound to 127.0.0.1).
+#   egress  — only for the consumer, which needs outbound internet to deliver webhooks.
+# Postgres and RabbitMQ publish no ports at all.
+
+x-app: &app
+  build: .
+  image: payments-service:local
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  networks: [backend]
+
+x-db-url: &db-url postgresql+asyncpg://${POSTGRES_USER:?set in .env}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:?set in .env}
+x-amqp-url: &amqp-url amqp://${RABBITMQ_USER:?set in .env}:${RABBITMQ_PASSWORD:?set in .env}@rabbitmq:5672/
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [backend]
+
+  rabbitmq:
+    image: rabbitmq:4.1-alpine
+    hostname: rabbitmq  # data dir depends on the node name, keep it stable across restarts
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set in .env}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+    restart: unless-stopped
+    networks: [backend]
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      DATABASE_URL: *db-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
+    environment:
+      DATABASE_URL: *db-url
+      API_KEY: ${API_KEY:?set in .env}
+      DOCS_ENABLED: ${DOCS_ENABLED:-false}
+      WEBHOOK_ALLOW_PRIVATE_NETWORKS: ${WEBHOOK_ALLOW_PRIVATE_NETWORKS:-false}
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    networks: [backend, edge]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  outbox-relay:
+    <<: *app
+    command: ["python", "-m", "app.outbox_relay"]
+    environment:
+      DATABASE_URL: *db-url
+      RABBITMQ_URL: *amqp-url
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-3}
+      RETRY_BASE_DELAY_MS: ${RETRY_BASE_DELAY_MS:-2000}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  consumer:
+    <<: *app
+    command: ["faststream", "run", "app.consumer.main:app"]
+    environment:
+      DATABASE_URL: *db-url
+      RABBITMQ_URL: *amqp-url
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set in .env}
+      WEBHOOK_ALLOW_PRIVATE_NETWORKS: ${WEBHOOK_ALLOW_PRIVATE_NETWORKS:-false}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-3}
+      RETRY_BASE_DELAY_MS: ${RETRY_BASE_DELAY_MS:-2000}
+    networks: [backend, egress]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+networks:
+  backend:
+    internal: true
+  edge: {}
+  egress: {}
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
